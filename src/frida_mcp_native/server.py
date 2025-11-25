@@ -1168,6 +1168,390 @@ def load_methods(
     return result
 
 
+# ============================================================================
+# Phase 3: Hook Template Generation Tools
+# ============================================================================
+
+# Default templates (same as RMS)
+ANDROID_HOOK_TEMPLATE = '''
+Java.perform(function () {
+    var classname = "{className}";
+    var classmethod = "{classMethod}";
+    var methodsignature = "{methodSignature}";
+    var hookclass = Java.use(classname);
+    
+    //{methodSignature}
+    hookclass.{classMethod}.{overload}implementation = function ({args}) {
+        send("[Call_Stack]\\nClass: " +classname+"\\nMethod: "+methodsignature+"\\n");
+        var ret = this.{classMethod}({args});
+        
+        var s="";
+        s=s+"[Hook_Stack]\\n"
+        s=s+"Class: " +classname+"\\n"
+        s=s+"Method: " +methodsignature+"\\n"
+        s=s+"Called by: "+Java.use('java.lang.Exception').$new().getStackTrace().toString().split(',')[1]+"\\n"
+        s=s+"Input: "+eval({argsEval})+"\\n";
+        s=s+"Output: "+ret+"\\n";
+        //uncomment the line below to print StackTrace
+        //s=s+"StackTrace: "+Java.use('android.util.Log').getStackTraceString(Java.use('java.lang.Exception').$new()).replace('java.lang.Exception','') +"\\n";
+
+        send(s);
+                
+        return ret;
+    };
+});
+'''
+
+IOS_HOOK_TEMPLATE = '''
+var classname = "{className}";
+var classmethod = "{classMethod}";
+var methodsignature = "{methodSignature}";
+try {
+  var hook = eval('ObjC.classes["' + classname + '"]["' + classmethod + '"]');
+ 
+  //{methodSignature}
+  Interceptor.attach(hook.implementation, {
+    onEnter: function (args) {
+      send("[Call_Stack]\\nClass: " + classname + "\\nMethod: " + methodsignature + "\\n");
+      this.s = ""
+      this.s = this.s + "[Hook_Stack]\\n"
+      this.s = this.s + "Class: " + classname + "\\n"
+      this.s = this.s + "Method: " + methodsignature + "\\n"
+      if (classmethod.indexOf(":") !== -1) {
+        var params = classmethod.split(":");
+        params[0] = params[0].split(" ")[1];
+        for (var i = 0; i < params.length - 1; i++) {
+          try {
+            this.s = this.s + "Input: " + params[i] + ": " + new ObjC.Object(args[2 + i]).toString() + "\\n";
+          } catch (e) {
+            this.s = this.s + "Input: " + params[i] + ": " + args[2 + i].toString() + "\\n";
+          }
+        }
+      }
+    },
+
+    //{methodSignature}
+    onLeave: function (retval) {
+      this.s = this.s + "Output: " + retval.toString() + "\\n";
+      //uncomment the lines below to replace retvalue
+      //retval.replace(0);  
+
+      //uncomment the line below to print StackTrace
+      //this.s = this.s + "StackTrace: \\n" + Thread.backtrace(this.context, Backtracer.ACCURATE).map(DebugSymbol.fromAddress).join('\\n') + "\\n";
+      send(this.s);
+    }
+  });
+} catch (err) {
+  send("[!] Exception: " + err.message);
+  send("Not able to hook \\nClass: " + classname + "\\nMethod: " + methodsignature + "\\n");
+}
+'''
+
+ANDROID_HEAP_SEARCH_TEMPLATE = '''
+Java.performNow(function () {
+    var classname = "{className}"
+    var classmethod = "{classMethod}";
+    var methodsignature = "{methodSignature}";
+
+    Java.choose(classname, {
+        onMatch: function (instance) {
+            try 
+            {
+                var returnValue;
+                //{methodSignature}
+                returnValue = instance.{classMethod}({args}); //<-- replace v[i] with the value that you want to pass
+
+                //Output
+                var s = "";
+                s=s+"[Heap_Search]\\n"
+                s=s + "[*] Heap Search - START\\n"
+
+                s=s + "Instance Found: " + instance.toString() + "\\n";
+                s=s + "Calling method: \\n";
+                s=s + "   Class: " + classname + "\\n"
+                s=s + "   Method: " + methodsignature + "\\n"
+                s=s + "-->Output: " + returnValue + "\\n";
+
+                s = s + "[*] Heap Search - END\\n"
+
+                send(s);
+            } 
+            catch (err) 
+            {
+                var s = "";
+                s=s+"[Heap_Search]\\n"
+                s=s + "[*] Heap Search - START\\n"
+                s=s + "Instance NOT Found or Exception while calling the method\\n";
+                s=s + "   Class: " + classname + "\\n"
+                s=s + "   Method: " + methodsignature + "\\n"
+                s=s + "-->Exception: " + err + "\\n"
+                s=s + "[*] Heap Search - END\\n"
+                send(s)
+            }
+
+        }
+    });
+
+});
+'''
+
+IOS_HEAP_SEARCH_TEMPLATE = '''
+var classname = "{className}";
+var classmethod = "{classMethod}";
+var methodsignature = "{methodSignature}";
+
+ObjC.choose(ObjC.classes[classname], {
+  onMatch: function (instance) {
+    try
+    {   
+        var returnValue;
+        //{methodSignature}
+        returnValue = instance[classmethod](); //<-- insert args if needed
+
+        var s=""
+        s=s+"[Heap_Search]\\n"
+        s=s + "[*] Heap Search - START\\n"
+        s=s+"Instance Found: " + instance.toString() + "\\n";
+        s=s+"Calling method: \\n";
+        s=s+"   Class: " + classname + "\\n"
+        s=s+"   Method: " + methodsignature + "\\n"
+        s=s+"-->Output: " + returnValue + "\\n";
+
+        s=s+"[*] Heap Search - END\\n"
+        send(s);
+        
+    }catch(err)
+    {
+        var s = "";
+        s=s+"[Heap_Search]\\n"
+        s=s + "[*] Heap Search - START\\n"
+        s=s + "Instance NOT Found or Exception while calling the method\\n";
+        s=s + "   Class: " + classname + "\\n"
+        s=s + "   Method: " + methodsignature + "\\n"
+        s=s + "-->Exception: " + err + "\\n"
+        s=s + "[*] Heap Search - END\\n"
+        send(s)
+    }
+  },
+  onComplete: function () {
+  }
+});
+'''
+
+
+def _generate_args_string(args_count: int) -> str:
+    """Generate v0, v1, v2... argument string"""
+    if args_count == 0:
+        return ""
+    return ",".join([f"v{i}" for i in range(args_count)])
+
+
+@mcp.tool()
+def generate_hook_template(
+    classes: List[str],
+    methods: Dict[str, List[Dict[str, str]]],
+    platform: str = "android",
+    custom_template: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Generate Frida hook code templates for specified classes and methods.
+    
+    This generates ready-to-use JavaScript code that can be executed with execute_script
+    or modified before execution. Does NOT execute the hooks - only generates code.
+    
+    Args:
+        classes: List of class names to generate hooks for
+        methods: Dictionary mapping class names to their methods (from load_methods output)
+                 Each method should have: name, args, ui_name
+        platform: Target platform - "android" or "ios"
+        custom_template: Optional custom template string with placeholders:
+                        {className}, {classMethod}, {methodSignature}, {overload}, {args}
+    
+    Returns:
+        Dictionary with generated hook code and metadata
+        
+    Example:
+        # First get methods using load_methods
+        methods_result = load_methods(target, ["com.example.MyClass"], device)
+        
+        # Then generate hooks
+        hooks = generate_hook_template(
+            classes=["com.example.MyClass"],
+            methods=methods_result["methods"],
+            platform="android"
+        )
+        
+        # Execute the generated code
+        execute_script(target, hooks["code"], device)
+    """
+    try:
+        # Select template based on platform
+        if custom_template:
+            template = custom_template
+        elif platform.lower() == "ios":
+            template = IOS_HOOK_TEMPLATE
+        else:
+            template = ANDROID_HOOK_TEMPLATE
+        
+        generated_code = ""
+        hooks_generated = 0
+        
+        for class_name in classes:
+            if class_name not in methods:
+                continue
+                
+            for method in methods[class_name]:
+                t = template
+                method_name = method.get("name", "")
+                method_args = method.get("args", '""')
+                method_ui_name = method.get("ui_name", method_name)
+                
+                # Replace placeholders
+                t = t.replace("{className}", class_name)
+                t = t.replace("{classMethod}", method_name)
+                t = t.replace("{classMethod}", method_name)
+                t = t.replace("{classMethod}", method_name)
+                t = t.replace("{methodSignature}", method_ui_name)
+                t = t.replace("{methodSignature}", method_ui_name)
+                
+                # Handle overload and args
+                if method_args != '""' and method_args:
+                    # Has arguments
+                    t = t.replace("{overload}", f"overload({method_args}).")
+                    
+                    # Count args
+                    args_count = len(method_args.split(","))
+                    args_str = _generate_args_string(args_count)
+                    
+                    t = t.replace("{args}", args_str)
+                    t = t.replace("{args}", args_str)
+                    t = t.replace("{argsEval}", args_str if args_str else '""')
+                else:
+                    # No arguments
+                    t = t.replace("{overload}", "overload().")
+                    t = t.replace("{args}", "")
+                    t = t.replace("{args}", "")
+                    t = t.replace("{argsEval}", '""')
+                
+                generated_code += t + "\n"
+                hooks_generated += 1
+        
+        return {
+            "status": "success",
+            "platform": platform,
+            "classCount": len(classes),
+            "hooksGenerated": hooks_generated,
+            "code": generated_code,
+            "note": "Use execute_script() to run this code, or modify it first as needed"
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+def heap_search_template(
+    classes: List[str],
+    methods: Dict[str, List[Dict[str, str]]],
+    platform: str = "android",
+    custom_template: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Generate Frida heap search code templates for specified classes and methods.
+    
+    This generates code that searches for existing instances of classes in the heap
+    and calls methods on them. Useful for interacting with already-instantiated objects.
+    
+    Args:
+        classes: List of class names to search for in heap
+        methods: Dictionary mapping class names to their methods (from load_methods output)
+                 Each method should have: name, args, ui_name
+        platform: Target platform - "android" or "ios"
+        custom_template: Optional custom template string with placeholders
+    
+    Returns:
+        Dictionary with generated heap search code and metadata
+        
+    Example:
+        # Get methods first
+        methods_result = load_methods(target, ["com.example.Singleton"], device)
+        
+        # Generate heap search code
+        heap_code = heap_search_template(
+            classes=["com.example.Singleton"],
+            methods=methods_result["methods"],
+            platform="android"
+        )
+        
+        # Modify args in the code if needed, then execute
+        execute_script(target, heap_code["code"], device)
+    
+    Note:
+        The generated code uses placeholder arguments (v0, v1, etc.)
+        You may need to replace these with actual values before execution.
+    """
+    try:
+        # Select template based on platform
+        if custom_template:
+            template = custom_template
+        elif platform.lower() == "ios":
+            template = IOS_HEAP_SEARCH_TEMPLATE
+        else:
+            template = ANDROID_HEAP_SEARCH_TEMPLATE
+        
+        generated_code = ""
+        templates_generated = 0
+        
+        for class_name in classes:
+            if class_name not in methods:
+                continue
+                
+            for method in methods[class_name]:
+                t = template
+                method_name = method.get("name", "")
+                method_args = method.get("args", '""')
+                method_ui_name = method.get("ui_name", method_name)
+                
+                # Replace placeholders
+                t = t.replace("{className}", class_name)
+                t = t.replace("{classMethod}", method_name)
+                t = t.replace("{classMethod}", method_name)
+                t = t.replace("{methodSignature}", method_ui_name)
+                t = t.replace("{methodSignature}", method_ui_name)
+                
+                # Handle args
+                if method_args != '""' and method_args:
+                    # Has arguments
+                    args_count = len(method_args.split(","))
+                    args_str = _generate_args_string(args_count)
+                    t = t.replace("{args}", args_str)
+                else:
+                    # No arguments
+                    t = t.replace("{args}", "")
+                
+                generated_code += t + "\n"
+                templates_generated += 1
+        
+        return {
+            "status": "success",
+            "platform": platform,
+            "classCount": len(classes),
+            "templatesGenerated": templates_generated,
+            "code": generated_code,
+            "note": "Replace v0, v1, etc. with actual values before execution. Use execute_script() to run."
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+
 @mcp.tool()
 def execute_script(
     target: str,
