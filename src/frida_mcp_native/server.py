@@ -814,9 +814,359 @@ def load_classes(
     return result
 
 
-# ============================================================================
-# Script Execution Tools
-# ============================================================================
+@mcp.tool()
+def load_classes_with_filter(
+    target: str,
+    filter_pattern: str,
+    device: Optional[str] = None,
+    is_regex: bool = False,
+    is_case_sensitive: bool = False,
+    match_whole: bool = False
+) -> Dict[str, Any]:
+    """
+    Enumerate loaded classes with advanced filtering options.
+    
+    This extends load_classes() with regex support, case sensitivity control,
+    and whole-word matching. Supports multiple filters separated by comma.
+    
+    Args:
+        target: Process name or PID to attach to
+        filter_pattern: Filter string or regex pattern. Multiple filters can be comma-separated.
+        device: Device identifier
+        is_regex: If True, treat filter_pattern as a regex
+        is_case_sensitive: If True, matching is case-sensitive
+        match_whole: If True, match entire class name (not just prefix/contains)
+    
+    Returns:
+        List of matching class names.
+    
+    Examples:
+        # Find all classes starting with "com.example"
+        load_classes_with_filter(target, "com.example")
+        
+        # Regex: find classes containing "Security" or "Crypto"  
+        load_classes_with_filter(target, "Security|Crypto", is_regex=True)
+        
+        # Multiple filters (comma-separated)
+        load_classes_with_filter(target, "com.example,com.myapp")
+    """
+    escaped_filter = filter_pattern.replace('\\', '\\\\').replace("'", "\\'").replace('"', '\\"')
+    
+    script = f"""
+(function() {{
+    var result = {{
+        platform: 'unknown',
+        classes: [],
+        count: 0,
+        filter: '{escaped_filter}',
+        error: null
+    }};
+    
+    var filterPattern = '{escaped_filter}';
+    var isRegex = {'true' if is_regex else 'false'};
+    var isCase = {'true' if is_case_sensitive else 'false'};
+    var isWhole = {'true' if match_whole else 'false'};
+    
+    function matchesFilter(className) {{
+        var originalClassName = className;
+        var testName = isCase ? className : className.toLowerCase();
+        var testFilter = isCase ? filterPattern : filterPattern.toLowerCase();
+        
+        if (isRegex) {{
+            try {{
+                var regex = new RegExp(testFilter, isCase ? '' : 'i');
+                return regex.test(className);
+            }} catch(e) {{
+                return false;
+            }}
+        }} else {{
+            // Support comma-separated filters
+            var filters = testFilter.split(',');
+            for (var i = 0; i < filters.length; i++) {{
+                var f = filters[i].trim();
+                if (f.length === 0) continue;
+                
+                if (isWhole) {{
+                    if (testName === f) return true;
+                }} else {{
+                    if (testName.indexOf(f) !== -1) return true;
+                }}
+            }}
+            return false;
+        }}
+    }}
+    
+    // Android
+    if (typeof Java !== 'undefined' && Java.available) {{
+        result.platform = 'Android';
+        Java.perform(function() {{
+            try {{
+                var classes = Java.enumerateLoadedClassesSync();
+                classes.forEach(function(className) {{
+                    if (className.length > 3 && matchesFilter(className)) {{
+                        result.classes.push(className);
+                    }}
+                }});
+                result.count = result.classes.length;
+            }} catch(e) {{
+                result.error = e.toString();
+            }}
+        }});
+    }}
+    // iOS
+    else if (typeof ObjC !== 'undefined' && ObjC.available) {{
+        result.platform = 'iOS';
+        try {{
+            for (var className in ObjC.classes) {{
+                if (ObjC.classes.hasOwnProperty(className) && 
+                    className.length > 3 && matchesFilter(className)) {{
+                    result.classes.push(className);
+                }}
+            }}
+            result.count = result.classes.length;
+        }} catch(e) {{
+            result.error = e.toString();
+        }}
+    }} else {{
+        result.error = 'Neither Java nor ObjC runtime available';
+    }}
+    
+    console.log(JSON.stringify(result));
+}})();
+"""
+    
+    result = execute_script(target=target, script=script, device=device, timeout=60)
+    
+    if result["status"] == "success":
+        try:
+            output = result.get("output", "")
+            json_match = re.search(r'\{.*\}', output, re.DOTALL)
+            if json_match:
+                class_data = json.loads(json_match.group())
+                return {
+                    "status": "success",
+                    "platform": class_data.get("platform", "unknown"),
+                    "count": class_data.get("count", 0),
+                    "filter": filter_pattern,
+                    "classes": class_data.get("classes", []),
+                    "error": class_data.get("error")
+                }
+        except json.JSONDecodeError:
+            pass
+    
+    return result
+
+
+@mcp.tool()
+def load_methods(
+    target: str,
+    class_names: List[str],
+    device: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Get all declared methods for specified classes.
+    
+    Returns method information including name, arguments (in Smali notation for Android),
+    and a UI-friendly signature. This is essential for hooking methods with overloads.
+    
+    Args:
+        target: Process name or PID to attach to
+        class_names: List of fully qualified class names to inspect
+        device: Device identifier
+    
+    Returns:
+        Dictionary mapping class names to their methods with signatures.
+        
+    Example output:
+        {
+            "com.example.MyClass": [
+                {"name": "myMethod", "args": '"int","java.lang.String"', "ui_name": "void myMethod(int, String)"},
+                ...
+            ]
+        }
+    """
+    # Serialize class names for JavaScript
+    classes_json = json.dumps(class_names)
+    
+    script = f"""
+(function() {{
+    var result = {{
+        platform: 'unknown',
+        methods: {{}},
+        classCount: 0,
+        methodCount: 0,
+        errors: [],
+        error: null
+    }};
+    
+    var classNames = {classes_json};
+    
+    // Android
+    if (typeof Java !== 'undefined' && Java.available) {{
+        result.platform = 'Android';
+        Java.perform(function() {{
+            classNames.forEach(function(className) {{
+                var classMethods = [];
+                try {{
+                    var jClass = Java.use(className);
+                    var methods = jClass.class.getDeclaredMethods();
+                    
+                    for (var i = 0; i < methods.length; i++) {{
+                        var m = methods[i].toString();
+                        
+                        // Remove throws clause
+                        var throwsIdx = m.indexOf(' throws ');
+                        if (throwsIdx !== -1) {{
+                            m = m.substring(0, throwsIdx);
+                        }}
+                        
+                        // Remove generics
+                        while (m.indexOf('<') !== -1) {{
+                            m = m.replace(/<[^>]*>/g, '');
+                        }}
+                        
+                        // Extract arguments from parentheses
+                        var argsMatch = m.match(/\\(([^)]*)\\)/);
+                        var argsStr = argsMatch ? argsMatch[1].trim() : '';
+                        
+                        // Extract method name (between last dot and opening paren)
+                        var parenIdx = m.indexOf('(');
+                        var beforeParen = m.substring(0, parenIdx);
+                        var lastDot = beforeParen.lastIndexOf('.');
+                        var methodName = beforeParen.substring(lastDot + 1);
+                        
+                        // Convert args to Smali notation
+                        var smaliArgs = '';
+                        if (argsStr.length === 0) {{
+                            smaliArgs = '""';
+                        }} else {{
+                            var args = argsStr.split(',');
+                            var convertedArgs = [];
+                            
+                            for (var j = 0; j < args.length; j++) {{
+                                var arg = args[j].trim();
+                                
+                                // Handle arrays
+                                var arrayPrefix = '';
+                                while (arg.endsWith('[]')) {{
+                                    arrayPrefix += '[';
+                                    arg = arg.substring(0, arg.length - 2);
+                                }}
+                                
+                                // Convert primitives to Smali notation
+                                var smaliArg = arg;
+                                if (arg === 'boolean') smaliArg = 'Z';
+                                else if (arg === 'byte') smaliArg = 'B';
+                                else if (arg === 'char') smaliArg = 'C';
+                                else if (arg === 'double') smaliArg = 'D';
+                                else if (arg === 'float') smaliArg = 'F';
+                                else if (arg === 'int') smaliArg = 'I';
+                                else if (arg === 'long') smaliArg = 'J';
+                                else if (arg === 'short') smaliArg = 'S';
+                                else if (arg === 'void') smaliArg = 'V';
+                                else if (arrayPrefix.length > 0 && arg.indexOf('.') !== -1) {{
+                                    smaliArg = 'L' + arg.replace(/\\./g, '/') + ';';
+                                }}
+                                
+                                convertedArgs.push('"' + arrayPrefix + smaliArg + '"');
+                            }}
+                            smaliArgs = convertedArgs.join(',');
+                        }}
+                        
+                        // Create object with string properties only
+                        var info = {{
+                            name: String(methodName),
+                            args: String(smaliArgs),
+                            ui_name: String(methods[i].toString().replace(className + '.', ''))
+                        }};
+                        
+                        classMethods.push(info);
+                    }}
+                    
+                    result.methods[className] = classMethods;
+                    result.methodCount += classMethods.length;
+                }} catch(e) {{
+                    result.errors.push(className + ': ' + e.toString());
+                    result.methods[className] = [];
+                }}
+            }});
+            result.classCount = classNames.length;
+        }});
+    }}
+    // iOS
+    else if (typeof ObjC !== 'undefined' && ObjC.available) {{
+        result.platform = 'iOS';
+        try {{
+            classNames.forEach(function(className) {{
+                var classMethods = [];
+                try {{
+                    if (ObjC.classes.hasOwnProperty(className)) {{
+                        var methods = ObjC.classes[className].$ownMethods;
+                        
+                        methods.forEach(function(methodName) {{
+                            var info = {{
+                                name: String(methodName),
+                                args: null,
+                                ui_name: String(methodName)
+                            }};
+                            
+                            try {{
+                                var method = ObjC.classes[className][methodName];
+                                info.returnType = String(method.returnType);
+                                var argTypes = method.argumentTypes;
+                                if (argTypes && argTypes.length >= 2) {{
+                                    argTypes = argTypes.slice(2);
+                                }}
+                                info.argumentTypes = argTypes ? argTypes.map(function(t) {{ return String(t); }}) : [];
+                                info.ui_name = '(' + info.returnType + ') ' + methodName + '(' + info.argumentTypes.join(', ') + ')';
+                            }} catch(e) {{
+                                // Method introspection failed, keep basic info
+                            }}
+                            
+                            classMethods.push(info);
+                        }});
+                    }}
+                    
+                    result.methods[className] = classMethods;
+                    result.methodCount += classMethods.length;
+                }} catch(e) {{
+                    result.errors.push(className + ': ' + e.toString());
+                    result.methods[className] = [];
+                }}
+            }});
+            result.classCount = classNames.length;
+        }} catch(e) {{
+            result.error = e.toString();
+        }}
+    }} else {{
+        result.error = 'Neither Java nor ObjC runtime available';
+    }}
+    
+    console.log(JSON.stringify(result));
+}})();
+"""
+    
+    result = execute_script(target=target, script=script, device=device, timeout=120)
+    
+    if result["status"] == "success":
+        try:
+            output = result.get("output", "")
+            json_match = re.search(r'\{.*\}', output, re.DOTALL)
+            if json_match:
+                method_data = json.loads(json_match.group())
+                return {
+                    "status": "success",
+                    "platform": method_data.get("platform", "unknown"),
+                    "classCount": method_data.get("classCount", 0),
+                    "methodCount": method_data.get("methodCount", 0),
+                    "methods": method_data.get("methods", {}),
+                    "errors": method_data.get("errors", [])
+                }
+        except json.JSONDecodeError:
+            pass
+    
+    return result
+
 
 @mcp.tool()
 def execute_script(
