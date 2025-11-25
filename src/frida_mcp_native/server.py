@@ -1662,6 +1662,368 @@ def hook_classes_and_methods(
             "hooksAttempted": hooks_count
         }
 
+
+# ============================================================================
+# Phase 5: API Monitor - System API Monitoring
+# ============================================================================
+
+# Default API Monitor categories (subset of common security-relevant APIs)
+API_MONITOR_CATEGORIES = {
+    "Device Info": [
+        {"clazz": "android.telephony.TelephonyManager", "method": "getDeviceId"},
+        {"clazz": "android.telephony.TelephonyManager", "method": "getSubscriberId"},
+        {"clazz": "android.telephony.TelephonyManager", "method": "getLine1Number"},
+        {"clazz": "android.net.wifi.WifiInfo", "method": "getMacAddress"},
+        {"clazz": "android.os.Debug", "method": "isDebuggerConnected"},
+    ],
+    "Crypto": [
+        {"clazz": "javax.crypto.spec.SecretKeySpec", "method": "$init"},
+        {"clazz": "javax.crypto.Cipher", "method": "doFinal"},
+    ],
+    "Hash": [
+        {"clazz": "java.security.MessageDigest", "method": "digest"},
+        {"clazz": "java.security.MessageDigest", "method": "update"},
+    ],
+    "Base64": [
+        {"clazz": "android.util.Base64", "method": "decode"},
+        {"clazz": "android.util.Base64", "method": "encode"},
+        {"clazz": "android.util.Base64", "method": "encodeToString"},
+    ],
+    "Network": [
+        {"clazz": "java.net.URL", "method": "openConnection"},
+        {"clazz": "java.net.Socket", "method": "$init"},
+    ],
+    "WebView": [
+        {"clazz": "android.webkit.WebView", "method": "loadUrl"},
+        {"clazz": "android.webkit.WebView", "method": "evaluateJavascript"},
+        {"clazz": "android.webkit.WebView", "method": "addJavascriptInterface"},
+    ],
+    "SharedPreferences": [
+        {"clazz": "android.app.SharedPreferencesImpl", "method": "getString"},
+        {"clazz": "android.app.SharedPreferencesImpl", "method": "getInt"},
+        {"clazz": "android.app.SharedPreferencesImpl", "method": "getBoolean"},
+        {"clazz": "android.app.SharedPreferencesImpl$EditorImpl", "method": "putString"},
+        {"clazz": "android.app.SharedPreferencesImpl$EditorImpl", "method": "putInt"},
+    ],
+    "Database": [
+        {"clazz": "android.database.sqlite.SQLiteDatabase", "method": "execSQL"},
+        {"clazz": "android.database.sqlite.SQLiteDatabase", "method": "rawQuery"},
+        {"clazz": "android.database.sqlite.SQLiteDatabase", "method": "insert"},
+    ],
+    "FileSystem": [
+        {"clazz": "java.io.FileOutputStream", "method": "write"},
+        {"clazz": "java.io.FileInputStream", "method": "read"},
+        {"clazz": "android.content.ContextWrapper", "method": "openFileInput"},
+        {"clazz": "android.content.ContextWrapper", "method": "openFileOutput"},
+    ],
+    "Commands": [
+        {"clazz": "java.lang.Runtime", "method": "exec"},
+        {"clazz": "java.lang.ProcessBuilder", "method": "start"},
+    ],
+    "JNI": [
+        {"clazz": "java.lang.Runtime", "method": "loadLibrary"},
+        {"clazz": "java.lang.Runtime", "method": "load"},
+    ],
+    "Clipboard": [
+        {"clazz": "android.content.ClipboardManager", "method": "getPrimaryClip"},
+        {"clazz": "android.content.ClipboardManager", "method": "setPrimaryClip"},
+    ],
+    "SMS": [
+        {"clazz": "android.telephony.SmsManager", "method": "sendTextMessage"},
+        {"clazz": "android.telephony.SmsManager", "method": "sendMultipartTextMessage"},
+    ],
+    "Location": [
+        {"clazz": "android.location.Location", "method": "getLatitude"},
+        {"clazz": "android.location.Location", "method": "getLongitude"},
+    ],
+    "Permissions": [
+        {"clazz": "android.app.ContextImpl", "method": "checkSelfPermission"},
+    ],
+}
+
+# API Monitor Hook Template - generates hooks that log method calls with arguments and return values
+API_MONITOR_TEMPLATE = '''
+// API Monitor Hook for {className}.{methodName}
+try {{
+    var clazz = Java.use('{className}');
+    var methodName = '{methodName}';
+    var overloads = clazz[methodName].overloads;
+    
+    for (var i = 0; i < overloads.length; i++) {{
+        overloads[i].implementation = function() {{
+            var args = Array.prototype.slice.call(arguments);
+            var argsStr = args.map(function(arg) {{
+                if (arg === null) return 'null';
+                if (arg === undefined) return 'undefined';
+                try {{
+                    if (typeof arg === 'object' && arg.toString) {{
+                        var s = arg.toString();
+                        return s.length > 100 ? s.substring(0, 100) + '...' : s;
+                    }}
+                    return String(arg);
+                }} catch(e) {{
+                    return '<' + typeof arg + '>';
+                }}
+            }}).join(', ');
+            
+            console.log('[API Monitor] {className}.{methodName}(' + argsStr + ')');
+            
+            var retval = this[methodName].apply(this, arguments);
+            
+            if (retval !== undefined && retval !== null) {{
+                try {{
+                    var retStr = retval.toString();
+                    retStr = retStr.length > 100 ? retStr.substring(0, 100) + '...' : retStr;
+                    console.log('[API Monitor] => ' + retStr);
+                }} catch(e) {{
+                    console.log('[API Monitor] => <return value>');
+                }}
+            }}
+            
+            return retval;
+        }};
+    }}
+    console.log('[+] Hooked: {className}.{methodName}');
+}} catch(e) {{
+    console.log('[-] Failed to hook {className}.{methodName}: ' + e.toString());
+}}
+'''
+
+
+@mcp.tool()
+def list_api_categories() -> Dict[str, Any]:
+    """
+    List all available API monitor categories.
+    
+    Returns the list of predefined API categories that can be monitored.
+    Each category contains hooks for related system APIs.
+    
+    Returns:
+        Dictionary with category names and their hook counts.
+    """
+    categories = {}
+    for name, hooks in API_MONITOR_CATEGORIES.items():
+        categories[name] = {
+            "hookCount": len(hooks),
+            "apis": [f"{h['clazz']}.{h['method']}" for h in hooks]
+        }
+    
+    return {
+        "status": "success",
+        "categoryCount": len(API_MONITOR_CATEGORIES),
+        "categories": categories
+    }
+
+
+@mcp.tool()
+def api_monitor(
+    target: str,
+    categories: List[str],
+    device: Optional[str] = None,
+    custom_hooks: Optional[List[Dict[str, str]]] = None
+) -> Dict[str, Any]:
+    """
+    Monitor system API calls for specified categories.
+    
+    This installs hooks on common Android system APIs to monitor their usage.
+    Useful for understanding app behavior, finding sensitive data flows, and
+    security analysis.
+    
+    Available categories:
+        - Device Info: Device identifiers, MAC addresses, debugger detection
+        - Crypto: Encryption/decryption operations (SecretKeySpec, Cipher)
+        - Hash: Hashing operations (MessageDigest)
+        - Base64: Base64 encoding/decoding
+        - Network: Network connections (URL, Socket)
+        - WebView: WebView operations (loadUrl, JavaScript interfaces)
+        - SharedPreferences: Shared preferences read/write
+        - Database: SQLite database operations
+        - FileSystem: File read/write operations
+        - Commands: Process/command execution (Runtime.exec)
+        - JNI: Native library loading
+        - Clipboard: Clipboard access
+        - SMS: SMS sending
+        - Location: GPS coordinates
+        - Permissions: Permission checks
+    
+    Args:
+        target: Process name or PID to attach to
+        categories: List of category names to monitor (e.g., ["Crypto", "Network"])
+        device: Device identifier
+        custom_hooks: Optional list of custom hooks with 'clazz' and 'method' keys
+    
+    Returns:
+        Dictionary with monitoring results
+        
+    Example:
+        # Monitor crypto and network APIs
+        result = api_monitor(
+            target="com.example.app",
+            categories=["Crypto", "Network", "SharedPreferences"],
+            device="192.168.1.100:27042"
+        )
+        
+        # Use custom hooks
+        result = api_monitor(
+            target=12345,
+            categories=["Crypto"],
+            custom_hooks=[
+                {"clazz": "com.example.MyClass", "method": "secretMethod"}
+            ]
+        )
+    """
+    try:
+        hooks_to_install = []
+        selected_categories = []
+        
+        # Collect hooks from selected categories
+        for category in categories:
+            if category in API_MONITOR_CATEGORIES:
+                hooks_to_install.extend(API_MONITOR_CATEGORIES[category])
+                selected_categories.append(category)
+        
+        # Add custom hooks if provided
+        if custom_hooks:
+            hooks_to_install.extend(custom_hooks)
+        
+        if not hooks_to_install:
+            return {
+                "status": "error",
+                "error": f"No valid categories found. Available: {list(API_MONITOR_CATEGORIES.keys())}"
+            }
+        
+        # Generate hook code
+        hook_code_parts = []
+        for hook in hooks_to_install:
+            clazz = hook.get("clazz", "")
+            method = hook.get("method", "")
+            if clazz and method:
+                code = API_MONITOR_TEMPLATE.format(
+                    className=clazz,
+                    methodName=method
+                )
+                hook_code_parts.append(code)
+        
+        # Wrap in Java.perform
+        full_script = f"""
+Java.perform(function() {{
+    console.log('[*] API Monitor starting...');
+    console.log('[*] Categories: {", ".join(selected_categories)}');
+    console.log('[*] Installing ' + {len(hooks_to_install)} + ' hooks...');
+    console.log('');
+    
+    {chr(10).join(hook_code_parts)}
+    
+    console.log('');
+    console.log('[*] API Monitor active! Intercepting calls...');
+}});
+"""
+        
+        # Execute the hooks
+        result = execute_script(
+            target=target,
+            script=full_script,
+            device=device,
+            timeout=60
+        )
+        
+        if result.get("status") == "success":
+            return {
+                "status": "success",
+                "categoriesMonitored": selected_categories,
+                "hooksInstalled": len(hooks_to_install),
+                "output": result.get("output", ""),
+                "note": "API Monitor is now active. Method calls will be logged with arguments and return values."
+            }
+        else:
+            return {
+                "status": "error",
+                "error": result.get("error") or result.get("output", "Unknown error"),
+                "categoriesAttempted": selected_categories
+            }
+            
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+def load_custom_api_config(
+    config_path: str
+) -> Dict[str, Any]:
+    """
+    Load a custom API monitor configuration file.
+    
+    The configuration file should be in the same JSON format as RMS's api_monitor.json:
+    [
+        {
+            "Category": "Category Name",
+            "HookType": "Java",
+            "hooks": [
+                {"clazz": "com.example.Class", "method": "methodName"},
+                ...
+            ]
+        },
+        ...
+    ]
+    
+    Args:
+        config_path: Path to the JSON configuration file
+    
+    Returns:
+        Dictionary with loaded categories and their hook counts
+        
+    Note:
+        This loads the configuration into memory. Use api_monitor() with
+        the loaded category names to actually install the hooks.
+    """
+    global API_MONITOR_CATEGORIES
+    
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        loaded_categories = {}
+        
+        for category_def in config:
+            cat_name = category_def.get("Category", "")
+            hook_type = category_def.get("HookType", "Java")
+            hooks = category_def.get("hooks", [])
+            
+            # Skip native hooks for now (require different approach)
+            if hook_type == "Native":
+                continue
+            
+            if cat_name and hooks:
+                API_MONITOR_CATEGORIES[cat_name] = hooks
+                loaded_categories[cat_name] = len(hooks)
+        
+        return {
+            "status": "success",
+            "configPath": config_path,
+            "categoriesLoaded": len(loaded_categories),
+            "categories": loaded_categories,
+            "totalCategories": len(API_MONITOR_CATEGORIES)
+        }
+        
+    except FileNotFoundError:
+        return {
+            "status": "error",
+            "error": f"Configuration file not found: {config_path}"
+        }
+    except json.JSONDecodeError as e:
+        return {
+            "status": "error",
+            "error": f"Invalid JSON in configuration file: {e}"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
 @mcp.tool()
 def execute_script(
     target: str,
