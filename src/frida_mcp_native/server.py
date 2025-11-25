@@ -1552,6 +1552,116 @@ def heap_search_template(
 
 
 
+
+# ============================================================================
+# Phase 4: Live Hook Execution
+# ============================================================================
+
+@mcp.tool()
+def hook_classes_and_methods(
+    target: str,
+    classes: List[str],
+    methods: Dict[str, List[Dict[str, str]]],
+    device: Optional[str] = None,
+    platform: str = "android",
+    custom_template: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Execute hooks in real-time for specified classes and methods.
+    
+    This generates and immediately executes Frida hooks on the target process.
+    Unlike generate_hook_template which only generates code, this function
+    actually installs the hooks and they start intercepting method calls.
+    
+    Args:
+        target: Process name or PID to attach to
+        classes: List of class names to hook
+        methods: Dictionary mapping class names to their methods (from load_methods output)
+                 Each method should have: name, args, ui_name
+        device: Device identifier
+        platform: Target platform - "android" or "ios"
+        custom_template: Optional custom hook template
+    
+    Returns:
+        Dictionary with hook installation results
+        
+    Example:
+        # Get methods first
+        methods_result = load_methods(target, ["com.example.MyClass"], device)
+        
+        # Install hooks
+        result = hook_classes_and_methods(
+            target=target,
+            classes=["com.example.MyClass"],
+            methods=methods_result["methods"],
+            device=device
+        )
+        
+        # Now all method calls will be logged!
+        
+    Note:
+        Hooks remain active until the target process is terminated or
+        you detach from it. Use create_session for persistent hooking.
+    """
+    # First generate the hook code
+    hook_result = generate_hook_template(
+        classes=classes,
+        methods=methods,
+        platform=platform,
+        custom_template=custom_template
+    )
+    
+    if hook_result.get("status") != "success":
+        return hook_result
+    
+    hook_code = hook_result.get("code", "")
+    hooks_count = hook_result.get("hooksGenerated", 0)
+    
+    if not hook_code:
+        return {
+            "status": "error",
+            "error": "No hook code generated"
+        }
+    
+    # Wrap the code to use console.log instead of send() for CLI compatibility
+    # and add a success message at the end
+    wrapped_code = f"""
+(function() {{
+    var hooksInstalled = 0;
+    var errors = [];
+    
+    try {{
+        {hook_code}
+        console.log("[*] Successfully installed " + {hooks_count} + " hooks");
+    }} catch(e) {{
+        console.log("[!] Error installing hooks: " + e.toString());
+    }}
+}})();
+"""
+    
+    # Execute the hooks
+    result = execute_script(
+        target=target,
+        script=wrapped_code,
+        device=device,
+        timeout=60
+    )
+    
+    if result.get("status") == "success":
+        return {
+            "status": "success",
+            "hooksInstalled": hooks_count,
+            "classes": classes,
+            "output": result.get("output", ""),
+            "note": "Hooks are now active. Method calls will be logged to the Frida console."
+        }
+    else:
+        return {
+            "status": "error",
+            "error": result.get("error") or result.get("output", "Unknown error"),
+            "hooksAttempted": hooks_count
+        }
+
 @mcp.tool()
 def execute_script(
     target: str,
