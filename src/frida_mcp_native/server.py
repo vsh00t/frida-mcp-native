@@ -434,6 +434,387 @@ def kill_process(
 
 
 # ============================================================================
+# RMS Core Tools - Phase 1: App Environment & Class Enumeration
+# ============================================================================
+
+@mcp.tool()
+def get_app_env_info(
+    target: str,
+    device: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Get application environment information including directories and paths.
+    
+    Returns information about the app's filesystem paths:
+    - Android: mainDirectory, filesDirectory, cacheDirectory, externalCacheDirectory, 
+               codeCacheDirectory, obbDir, packageCodePath
+    - iOS: mainDirectory, BundlePath, CachesDirectory, DocumentDirectory, LibraryDirectory
+    
+    Args:
+        target: Process name or PID to attach to
+        device: Device identifier
+    
+    Returns:
+        Dictionary with app environment paths.
+    """
+    script = """
+(function() {
+    var env = {};
+    
+    // Android
+    if (typeof Java !== 'undefined' && Java.available) {
+        Java.perform(function() {
+            try {
+                var ActivityThread = Java.use('android.app.ActivityThread');
+                var targetApp = ActivityThread.currentApplication();
+                
+                if (targetApp != null) {
+                    var context = targetApp.getApplicationContext();
+                    env = {
+                        platform: 'Android',
+                        mainDirectory: context.getFilesDir().getParent(),
+                        filesDirectory: context.getFilesDir().getAbsolutePath().toString(),
+                        cacheDirectory: context.getCacheDir().getAbsolutePath().toString(),
+                        externalCacheDirectory: context.getExternalCacheDir() ? 
+                            context.getExternalCacheDir().getAbsolutePath().toString() : 'N/A',
+                        codeCacheDirectory: 'getCodeCacheDir' in context ? 
+                            context.getCodeCacheDir().getAbsolutePath().toString() : 'N/A',
+                        obbDir: context.getObbDir().getAbsolutePath().toString(),
+                        packageCodePath: context.getPackageCodePath().toString().replace("/base.apk", ""),
+                        packageName: context.getPackageName()
+                    };
+                }
+            } catch(e) {
+                env.error = e.toString();
+            }
+        });
+    }
+    // iOS
+    else if (typeof ObjC !== 'undefined' && ObjC.available) {
+        try {
+            var NSUserDomainMask = 1;
+            var NSLibraryDirectory = 5;
+            var NSDocumentDirectory = 9;
+            var NSCachesDirectory = 13;
+            
+            var NSBundle = ObjC.classes.NSBundle.mainBundle();
+            var NSFileManager = ObjC.classes.NSFileManager.defaultManager();
+            
+            var libPath = NSFileManager.URLsForDirectory_inDomains_(NSLibraryDirectory, NSUserDomainMask)
+                .lastObject().path().toString();
+            
+            env = {
+                platform: 'iOS',
+                mainDirectory: libPath.replace("Library", ""),
+                BundlePath: NSBundle.bundlePath().toString(),
+                CachesDirectory: NSFileManager.URLsForDirectory_inDomains_(NSCachesDirectory, NSUserDomainMask)
+                    .lastObject().path().toString(),
+                DocumentDirectory: NSFileManager.URLsForDirectory_inDomains_(NSDocumentDirectory, NSUserDomainMask)
+                    .lastObject().path().toString(),
+                LibraryDirectory: libPath,
+                bundleIdentifier: NSBundle.bundleIdentifier() ? NSBundle.bundleIdentifier().toString() : 'N/A'
+            };
+        } catch(e) {
+            env.error = e.toString();
+        }
+    } else {
+        env = {error: 'Neither Java nor ObjC runtime available'};
+    }
+    
+    console.log(JSON.stringify(env));
+})();
+"""
+    
+    result = execute_script(target=target, script=script, device=device, timeout=15)
+    
+    if result["status"] == "success":
+        try:
+            # Parse JSON from output
+            output = result.get("output", "")
+            # Find JSON in output
+            json_match = re.search(r'\{.*\}', output, re.DOTALL)
+            if json_match:
+                env_data = json.loads(json_match.group())
+                return {
+                    "status": "success",
+                    "environment": env_data
+                }
+        except json.JSONDecodeError:
+            pass
+        
+        return {
+            "status": "success",
+            "environment": result.get("output", "")
+        }
+    
+    return result
+
+
+@mcp.tool()
+def list_files_at_path(
+    target: str,
+    path: str,
+    device: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    List files at a specific path on the device.
+    
+    Returns file information including:
+    - File names
+    - Whether each is a file or directory
+    - Size, permissions (readable/writable)
+    - Last modified date
+    
+    Args:
+        target: Process name or PID to attach to
+        path: Path to list files from (e.g., "/data/data/com.example.app")
+        device: Device identifier
+    
+    Returns:
+        Dictionary with path info and list of files with attributes.
+    """
+    # Escape the path for JavaScript
+    escaped_path = path.replace('\\', '\\\\').replace("'", "\\'")
+    
+    script = f"""
+(function() {{
+    var listResult = {{
+        files: {{}},
+        path: '{escaped_path}',
+        readable: false,
+        writable: false,
+        error: null
+    }};
+    
+    // Android
+    if (typeof Java !== 'undefined' && Java.available) {{
+        Java.perform(function() {{
+            try {{
+                var File = Java.use("java.io.File");
+                var currentPath = File.$new('{escaped_path}');
+                
+                listResult.readable = currentPath.canRead() ? true : false;
+                listResult.writable = currentPath.canWrite() ? true : false;
+                
+                if (!currentPath.exists()) {{
+                    listResult.error = 'Path does not exist';
+                    console.log(JSON.stringify(listResult));
+                    return;
+                }}
+                
+                if (!currentPath.isDirectory()) {{
+                    listResult.error = 'Path is not a directory';
+                    console.log(JSON.stringify(listResult));
+                    return;
+                }}
+                
+                var files = currentPath.listFiles();
+                if (files != null) {{
+                    for (var i = 0; i < files.length; i++) {{
+                        var f = files[i];
+                        var name = f.getName().toString();
+                        listResult.files[name] = {{
+                            fileName: name,
+                            isDirectory: f.isDirectory() ? true : false,
+                            isFile: f.isFile() ? true : false,
+                            isHidden: f.isHidden() ? true : false,
+                            size: parseInt(f.length()),
+                            lastModified: new Date(f.lastModified()).toISOString().replace('T', ' ').split('.')[0],
+                            readable: f.canRead() ? true : false,
+                            writable: f.canWrite() ? true : false
+                        }};
+                    }}
+                }}
+            }} catch(e) {{
+                listResult.error = e.toString();
+            }}
+        }});
+    }}
+    // iOS
+    else if (typeof ObjC !== 'undefined' && ObjC.available) {{
+        try {{
+            var NSFileManager = ObjC.classes.NSFileManager.defaultManager();
+            var nsPath = ObjC.classes.NSString.stringWithString_('{escaped_path}');
+            
+            listResult.readable = NSFileManager.isReadableFileAtPath_(nsPath);
+            listResult.writable = NSFileManager.isWritableFileAtPath_(nsPath);
+            
+            if (!listResult.readable) {{
+                listResult.error = 'Path is not readable';
+                console.log(JSON.stringify(listResult));
+                return;
+            }}
+            
+            var contents = NSFileManager.contentsOfDirectoryAtPath_error_('{escaped_path}', NULL);
+            if (contents) {{
+                var count = contents.count();
+                for (var i = 0; i < count; i++) {{
+                    var fileName = contents.objectAtIndex_(i).toString();
+                    var filePath = '{escaped_path}/' + fileName;
+                    var fileNSPath = ObjC.classes.NSString.stringWithString_(filePath);
+                    
+                    var attrs = NSFileManager.attributesOfItemAtPath_error_(fileNSPath, NULL);
+                    var fileInfo = {{
+                        fileName: fileName,
+                        readable: NSFileManager.isReadableFileAtPath_(fileNSPath),
+                        writable: NSFileManager.isWritableFileAtPath_(fileNSPath)
+                    }};
+                    
+                    if (attrs) {{
+                        var fileType = attrs.objectForKey_('NSFileType');
+                        fileInfo.isDirectory = fileType ? fileType.toString() === 'NSFileTypeDirectory' : false;
+                        fileInfo.isFile = !fileInfo.isDirectory;
+                        fileInfo.size = attrs.objectForKey_('NSFileSize') ? 
+                            parseInt(attrs.objectForKey_('NSFileSize').toString()) : 0;
+                        fileInfo.lastModified = attrs.objectForKey_('NSFileModificationDate') ? 
+                            attrs.objectForKey_('NSFileModificationDate').toString() : 'N/A';
+                        fileInfo.isHidden = attrs.objectForKey_('NSFileExtensionHidden') ? 
+                            attrs.objectForKey_('NSFileExtensionHidden').toString() === '1' : false;
+                    }}
+                    
+                    listResult.files[fileName] = fileInfo;
+                }}
+            }}
+        }} catch(e) {{
+            listResult.error = e.toString();
+        }}
+    }} else {{
+        listResult.error = 'Neither Java nor ObjC runtime available';
+    }}
+    
+    console.log(JSON.stringify(listResult));
+}})();
+"""
+    
+    result = execute_script(target=target, script=script, device=device, timeout=30)
+    
+    if result["status"] == "success":
+        try:
+            output = result.get("output", "")
+            json_match = re.search(r'\{.*\}', output, re.DOTALL)
+            if json_match:
+                file_data = json.loads(json_match.group())
+                return {
+                    "status": "success",
+                    "result": file_data
+                }
+        except json.JSONDecodeError:
+            pass
+        
+        return {
+            "status": "success",
+            "result": result.get("output", "")
+        }
+    
+    return result
+
+
+@mcp.tool()
+def load_classes(
+    target: str,
+    device: Optional[str] = None,
+    filter_prefix: Optional[str] = None,
+    exclude_androidx: bool = True,
+    min_length: int = 5
+) -> Dict[str, Any]:
+    """
+    Enumerate all loaded classes in the application.
+    
+    This is a core RMS function that lists all classes loaded in the runtime.
+    For Android uses Java.enumerateLoadedClassesSync(), for iOS iterates ObjC.classes.
+    
+    Args:
+        target: Process name or PID to attach to
+        device: Device identifier
+        filter_prefix: Optional prefix to filter classes (e.g., "com.example")
+        exclude_androidx: If True, exclude androidx.* classes (default True)
+        min_length: Minimum class name length (default 5)
+    
+    Returns:
+        List of class names.
+    """
+    filter_code = ""
+    if filter_prefix:
+        escaped_prefix = filter_prefix.replace('\\', '\\\\').replace("'", "\\'").lower()
+        filter_code = f"&& className.toLowerCase().startsWith('{escaped_prefix}')"
+    
+    exclude_code = "&& !className.includes('androidx')" if exclude_androidx else ""
+    
+    script = f"""
+(function() {{
+    var result = {{
+        platform: 'unknown',
+        classes: [],
+        count: 0,
+        error: null
+    }};
+    
+    // Android
+    if (typeof Java !== 'undefined' && Java.available) {{
+        result.platform = 'Android';
+        Java.perform(function() {{
+            try {{
+                var classes = Java.enumerateLoadedClassesSync();
+                classes.forEach(function(className) {{
+                    if (className.length > {min_length} {exclude_code} {filter_code}) {{
+                        result.classes.push(className);
+                    }}
+                }});
+                result.count = result.classes.length;
+            }} catch(e) {{
+                result.error = e.toString();
+            }}
+        }});
+    }}
+    // iOS
+    else if (typeof ObjC !== 'undefined' && ObjC.available) {{
+        result.platform = 'iOS';
+        try {{
+            for (var className in ObjC.classes) {{
+                if (ObjC.classes.hasOwnProperty(className) && 
+                    className.length > {min_length} {filter_code}) {{
+                    result.classes.push(className);
+                }}
+            }}
+            result.count = result.classes.length;
+        }} catch(e) {{
+            result.error = e.toString();
+        }}
+    }} else {{
+        result.error = 'Neither Java nor ObjC runtime available';
+    }}
+    
+    console.log(JSON.stringify(result));
+}})();
+"""
+    
+    result = execute_script(target=target, script=script, device=device, timeout=60)
+    
+    if result["status"] == "success":
+        try:
+            output = result.get("output", "")
+            json_match = re.search(r'\{.*\}', output, re.DOTALL)
+            if json_match:
+                class_data = json.loads(json_match.group())
+                return {
+                    "status": "success",
+                    "platform": class_data.get("platform", "unknown"),
+                    "count": class_data.get("count", 0),
+                    "classes": class_data.get("classes", []),
+                    "error": class_data.get("error")
+                }
+        except json.JSONDecodeError:
+            pass
+        
+        return {
+            "status": "success",
+            "output": result.get("output", "")
+        }
+    
+    return result
+
+
+# ============================================================================
 # Script Execution Tools
 # ============================================================================
 
